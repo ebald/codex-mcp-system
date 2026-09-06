@@ -1,0 +1,18 @@
+# Instruções locais do agente; não publicar.
+AGENTS.md
+
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.log
+.env
+.env.*
+spike_app_server.py
