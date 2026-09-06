@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import shutil
 from collections.abc import Mapping
@@ -32,8 +33,8 @@ def _parse_positive_float(name: str, raw: str | None, *, default: float) -> floa
         value = float(raw)
     except ValueError as exc:
         raise ConfigurationError(f"{name} deve ser um número") from exc
-    if value <= 0:
-        raise ConfigurationError(f"{name} deve ser maior que zero")
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigurationError(f"{name} deve ser um número finito maior que zero")
     return value
 
 

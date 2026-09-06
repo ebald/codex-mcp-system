@@ -45,3 +45,9 @@ def test_child_environment_removes_only_openai_key() -> None:
 def test_invalid_boolean_is_rejected(value: str) -> None:
     with pytest.raises(ConfigurationError):
         Settings.from_env({"CODEX_MCP_ALLOW_API_KEY": value})
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1"])
+def test_non_finite_or_non_positive_timeout_is_rejected(value: str) -> None:
+    with pytest.raises(ConfigurationError):
+        Settings.from_env({"CODEX_MCP_TIMEOUT_SECONDS": value})

@@ -143,7 +143,8 @@ def create_mcp_server(
             list[str], Field(description="De uma a quatro imagens PNG/JPEG/WebP locais")
         ],
         mask_path: Annotated[
-            str | None, Field(description="Máscara PNG/JPEG/WebP local opcional")
+            str | None,
+            Field(description="Imagem opcional que marca a área a editar; normalmente omita"),
         ] = None,
         size: str = "auto",
         quality: Quality = "medium",

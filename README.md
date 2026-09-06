@@ -109,6 +109,7 @@ Bloco pronto para copiar:
       "command": "/Users/baker/repos-own/codex-mcp-system/.venv/bin/codex-mcp-system",
       "args": ["serve"],
       "env": {
+        "CODEX_MCP_CODEX_BIN": "/Applications/ChatGPT.app/Contents/Resources/codex",
         "CODEX_MCP_OUTPUT_DIR": "/Users/baker/Pictures/codex-mcp-system"
       }
     }
@@ -117,6 +118,67 @@ Bloco pronto para copiar:
 ```
 
 Não adicione `OPENAI_API_KEY`. O mesmo exemplo está em `examples/mcp-client-config.json`.
+
+## Usar no Claude Code
+
+O Claude Code inicia este servidor automaticamente quando precisa dele. Não é necessário deixar
+`serve` aberto em outro terminal nem manter uma conversa do Codex aberta. O executável `codex`
+e o login ChatGPT devem continuar disponíveis no computador.
+
+Neste computador, o ambiente virtual já está instalado. Primeiro confira o login sem gerar imagem:
+
+```bash
+CODEX_MCP_CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex \
+  /Users/baker/repos-own/codex-mcp-system/.venv/bin/codex-mcp-system doctor
+```
+
+Se o resultado mostrar `doctor_ok: true`, cadastre o servidor uma única vez:
+
+```bash
+claude mcp add --transport stdio --scope user \
+  --env CODEX_MCP_CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex \
+  --env CODEX_MCP_OUTPUT_DIR=/Users/baker/Pictures/codex-mcp-system \
+  codex-mcp-system -- \
+  /Users/baker/repos-own/codex-mcp-system/.venv/bin/codex-mcp-system serve
+```
+
+O escopo `user` disponibiliza o servidor em todos os seus projetos do Claude Code. Para disponibilizar
+somente no projeto atual, troque por `--scope local`. Os caminhos acima são os desta instalação;
+em outro computador, use os caminhos retornados por `command -v codex` e pelo seu ambiente virtual.
+
+Confira o cadastro:
+
+```bash
+claude mcp get codex-mcp-system
+```
+
+Abra uma nova sessão de `claude` e digite `/mcp` para conferir a conexão e as quatro ferramentas.
+Então peça, em linguagem natural:
+
+> Use codex-mcp-system para verificar se minha conta está pronta, sem gerar imagem.
+
+Para gerar:
+
+> Use codex-mcp-system para gerar uma foto de um vaso azul sobre uma mesa de madeira,
+> em qualidade low. Salve como vaso-azul.png e me informe o caminho.
+
+Para editar:
+
+> Use codex-mcp-system para editar /Users/baker/Pictures/codex-mcp-system/vaso-azul.png.
+> Troque apenas o fundo por branco e preserve o vaso.
+
+Consultas de status não geram imagens. Pedidos de geração e edição usam a cota do Codex da conta
+ChatGPT autenticada. O uso do próprio Claude continua sujeito à sua configuração e ao seu plano.
+O arquivo final fica na pasta indicada, mesmo quando o cliente não mostra uma prévia inline.
+
+Para remover somente a conexão do Claude Code:
+
+```bash
+claude mcp remove --scope user codex-mcp-system
+```
+
+Sintaxe e escopos conferidos com Claude Code 2.1.105 e com a
+[documentação oficial de MCP do Claude Code](https://code.claude.com/docs/en/mcp).
 
 ## Ferramentas MCP
 
@@ -194,7 +256,25 @@ Suposições documentadas: o override de saída é o diretório final, não rece
 - o cliente que receber acesso ao servidor poderá consumir a cota do Codex e criar arquivos locais;
 - não há relay público, scraping de `chatgpt.com`, reutilização de cookies nem fallback PAYG.
 
-A máscara de edição é enviada pelo tipo oficial `localImage` e descrita semanticamente ao Codex. A versão atual do App Server não expõe um campo de máscara separado em `turn/start`, portanto o recorte exato depende da interpretação da capacidade integrada.
+Em termos simples, **máscara** é uma segunda imagem que marca onde fazer uma alteração — por exemplo,
+a região do fundo de uma foto. Ela é opcional. Para gerar imagens novas ou pedir uma edição comum,
+omita `mask_path`: basta descrever a alteração e fornecer a imagem original. As marcações servem como
+guia visual; este fluxo não garante que cada pixel fora delas permaneça idêntico.
+O App Server recebe esse guia como mais uma imagem local (`localImage`), pois o schema desta versão
+não oferece um campo exclusivo para máscara.
+
+O servidor valida nomes de arquivo antes de iniciar uma geração e confirma o login novamente quando
+o pedido sai da fila. Um cancelamento MCP ou timeout solicita a interrupção do turno; se o processo
+não responder ou não devolver o ID do turno, o servidor encerra o filho. Isso não desfaz a cota já
+consumida. A conversa efêmera é liberada ao final, e uma geração submetida nunca é repetida automaticamente.
+
+As ferramentas de shell são desabilitadas na configuração da conversa de imagem. O provedor é fixado
+em `openai` com fallback de provedor desabilitado; a autenticação precisa ser `chatgpt` imediatamente
+antes do envio. As instruções restritivas e o sandbox complementam essas medidas.
+
+Imagens têm também limite de 40 milhões de pixels após descompressão e são abertas integralmente
+para detectar arquivos truncados. Pillow é usado somente para validação e metadados: se o backend
+devolver outro formato, o servidor informa o erro, sem converter a imagem ou gerar outra automaticamente.
 
 ## Smoke test
 
@@ -207,6 +287,12 @@ Este comando faz **uma geração real** em qualidade `low` e consome a cota gera
 Não o repita desnecessariamente. Ele se recusa a executar com autenticação `apikey`.
 
 Na prova de conceito de 2026-09-06, o backend `CodexAppServerBackend` gerou com sucesso o cubo vermelho solicitado. O arquivo retornado era PNG válido, 1.687.720 bytes e 1254×1254 pixels; a dimensão efetiva ilustra a normalização mencionada acima.
+
+Na revisão seguinte, foram verificados novamente o `doctor`, as quatro ferramentas MCP e a criação
+e liberação de conversa com as restrições atualizadas, usando o App Server real sem iniciar um turno
+gerador. Geração e edição completas por MCP, cancelamentos e falhas são cobertos também pelo backend
+simulado. A edição ainda não foi validada com geração real; nenhum teste simulado deve ser interpretado
+como prova da qualidade de uma edição produzida pelo modelo.
 
 ## Solução de problemas
 

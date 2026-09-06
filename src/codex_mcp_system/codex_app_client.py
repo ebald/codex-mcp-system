@@ -14,9 +14,11 @@ from typing import Any
 from codex_mcp_system import __version__
 from codex_mcp_system.config import Settings
 from codex_mcp_system.errors import (
+    APIKeyAuthenticationBlockedError,
     AppServerProtocolError,
     AppServerStartError,
     ArtifactNotFoundError,
+    AuthenticationRequiredError,
     GenerationTimeoutError,
     ImagegenUnavailableError,
     PolicyRefusalError,
@@ -41,6 +43,10 @@ _SECRET_RE = re.compile(
 )
 _OAUTH_URL_RE = re.compile(r"https?://[^\s]+(?:oauth|authorize)[^\s]*", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_SESSION_RE = re.compile(
+    r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
+    r"|\b(?:thr|turn|sess)_[a-zA-Z0-9_-]+"
+)
 
 
 def redact_diagnostic(value: object) -> str:
@@ -48,6 +54,7 @@ def redact_diagnostic(value: object) -> str:
     text = _SECRET_RE.sub(r"\1<redigido>", text)
     text = _OAUTH_URL_RE.sub("<url-oauth-redigida>", text)
     text = _EMAIL_RE.sub("<email-redigido>", text)
+    text = _SESSION_RE.sub("<id-redigido>", text)
     return text[:2000]
 
 
@@ -157,7 +164,9 @@ class CodexAppClient:
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self.generation_lock = asyncio.Lock()
-        self._closed = False
+        self._initialized = False
+        self._reader_failure: Exception | None = None
+        self._active_thread_id: str | None = None
 
     async def __aenter__(self) -> CodexAppClient:
         await self.ensure_started()
@@ -168,29 +177,40 @@ class CodexAppClient:
 
     @property
     def running(self) -> bool:
-        return self.process is not None and self.process.returncode is None
+        return (
+            self.process is not None
+            and self.process.returncode is None
+            and self._reader_failure is None
+        )
 
     async def ensure_started(self) -> None:
-        if self.running:
+        if self.running and self._initialized:
             return
         async with self._start_lock:
-            if self.running:
+            if self.running and self._initialized:
                 return
+            if self.process is not None:
+                await self.shutdown()
             last_error: Exception | None = None
             for attempt in range(2):
                 try:
                     await self._start_once()
                     return
+                except asyncio.CancelledError:
+                    await self.shutdown()
+                    raise
                 except Exception as exc:  # a segunda tentativa é somente pré-trabalho
                     last_error = exc
-                    await self.shutdown(mark_closed=False)
+                    await self.shutdown()
                     if attempt == 0:
                         logger.warning("App Server falhou antes do trabalho; reiniciando uma vez")
             detail = redact_diagnostic(last_error)
             raise AppServerStartError(f"Não foi possível inicializar o App Server: {detail}")
 
     async def _start_once(self) -> None:
-        self._closed = False
+        self._initialized = False
+        self._reader_failure = None
+        self._stderr_tail.clear()
         codex_bin = self.settings.resolve_codex_bin()
         try:
             self.process = await asyncio.create_subprocess_exec(
@@ -221,10 +241,10 @@ class CodexAppClient:
             request_timeout=20,
         )
         await self._notify("initialized", {})
+        self._initialized = True
 
-    async def shutdown(self, *, mark_closed: bool = True) -> None:
-        if mark_closed:
-            self._closed = True
+    async def shutdown(self) -> None:
+        self._initialized = False
         process = self.process
         self.process = None
         if process is not None and process.stdin is not None:
@@ -235,11 +255,13 @@ class CodexAppClient:
             try:
                 await asyncio.wait_for(process.wait(), timeout=3)
             except TimeoutError:
-                process.terminate()
+                with contextlib.suppress(ProcessLookupError):
+                    process.terminate()
                 try:
                     await asyncio.wait_for(process.wait(), timeout=3)
                 except TimeoutError:
-                    process.kill()
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
                     await process.wait()
         current = asyncio.current_task()
         for task in (self._reader_task, self._stderr_task):
@@ -338,7 +360,12 @@ class CodexAppClient:
                             )
                         else:
                             result = message.get("result")
-                            future.set_result(result if isinstance(result, dict) else {})
+                            if isinstance(result, dict):
+                                future.set_result(result)
+                            else:
+                                future.set_exception(
+                                    AppServerProtocolError("Resposta App Server não é um objeto.")
+                                )
                     continue
                 if request_id is not None and isinstance(method, str):
                     await self._handle_server_request(request_id, method)
@@ -356,6 +383,7 @@ class CodexAppClient:
             failure = AppServerProtocolError(f"Falha ao ler o App Server: {redact_diagnostic(exc)}")
         finally:
             if failure is not None:
+                self._reader_failure = failure
                 for future in self._pending.values():
                     if not future.done():
                         future.set_exception(failure)
@@ -366,11 +394,22 @@ class CodexAppClient:
     async def _stderr_loop(self) -> None:
         process = self.process
         assert process is not None and process.stderr is not None
-        while True:
-            line = await process.stderr.readline()
-            if not line:
-                return
-            self._stderr_tail.append(redact_diagnostic(line.decode(errors="replace").rstrip()))
+        buffer = b""
+        while chunk := await process.stderr.read(4096):
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                self._stderr_tail.append(redact_diagnostic(line.decode(errors="replace")))
+            if len(buffer) > 65_536:
+                # Descartar a linha inteira evita expor um segredo cortado no meio.
+                buffer = b""
+                self._stderr_tail.append("<linha de diagnóstico longa omitida>")
+                while chunk := await process.stderr.read(4096):
+                    if b"\n" in chunk:
+                        _, buffer = chunk.split(b"\n", 1)
+                        break
+        if buffer:
+            self._stderr_tail.append(redact_diagnostic(buffer.decode(errors="replace")))
 
     async def _handle_server_request(self, request_id: int | str, method: str) -> None:
         if method == "currentTime/read":
@@ -391,6 +430,14 @@ class CodexAppClient:
 
     def _route_notification(self, event: dict[str, Any]) -> None:
         params = event.get("params", {})
+        if params.get("threadId") != self._active_thread_id or self._active_thread_id is None:
+            return
+        method = event.get("method")
+        if method == "item/completed":
+            if params.get("item", {}).get("type") != "imageGeneration":
+                return
+        elif method != "turn/completed":
+            return
         turn_id = params.get("turnId")
         if not turn_id and isinstance(params.get("turn"), Mapping):
             turn_id = params["turn"].get("id")
@@ -400,6 +447,8 @@ class CodexAppClient:
         if queue is not None:
             queue.put_nowait(event)
         else:
+            if turn_id not in self._turn_backlog and len(self._turn_backlog) >= 16:
+                self._turn_backlog.pop(next(iter(self._turn_backlog)))
             self._turn_backlog[turn_id].append(event)
 
     def _turn_queue(self, turn_id: str) -> asyncio.Queue[dict[str, Any]]:
@@ -414,8 +463,9 @@ class CodexAppClient:
             return ""
         return "Detalhe: " + " | ".join(self._stderr_tail)[-2000:]
 
-    async def account_read(self) -> AccountInfo:
-        result = await self.request("account/read", {"refreshToken": False}, request_timeout=20)
+    async def account_read(self, *, start_if_needed: bool = True) -> AccountInfo:
+        request = self.request if start_if_needed else self._request_without_start
+        result = await request("account/read", {"refreshToken": False}, request_timeout=20)
         account = result.get("account")
         if not isinstance(account, Mapping):
             return AccountInfo(auth_mode="none")
@@ -456,7 +506,14 @@ class CodexAppClient:
             stderr=asyncio.subprocess.PIPE,
             env=self.settings.child_environment(),
         )
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+        except (TimeoutError, asyncio.CancelledError):
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+            await process.wait()
+            raise
         if process.returncode != 0:
             raise AppServerStartError("Não foi possível consultar a versão do Codex.")
         return stdout.decode(errors="replace").strip()
@@ -470,50 +527,67 @@ class CodexAppClient:
     ) -> AppServerImageArtifact:
         async with self.generation_lock:
             await self.ensure_started()
-            thread_result = await self.request(
-                "thread/start",
-                {
-                    "cwd": str(cwd),
-                    "ephemeral": True,
-                    "approvalPolicy": "never",
-                    "sandbox": "workspace-write",
-                    "developerInstructions": DEVELOPER_INSTRUCTIONS,
-                    "runtimeWorkspaceRoots": [str(cwd)],
-                },
-                request_timeout=30,
-            )
-            try:
-                thread_id = thread_result["thread"]["id"]
-            except (KeyError, TypeError) as exc:
-                raise AppServerProtocolError(
-                    "thread/start retornou um schema incompatível."
-                ) from exc
-            inputs: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-            inputs.extend({"type": "localImage", "path": str(path)} for path in attachments)
-            # Depois desta chamada o trabalho pode ter consumido cota: nunca há retry automático.
-            turn_result = await self.request(
-                "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": inputs,
-                    "cwd": str(cwd),
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": {
-                        "type": "workspaceWrite",
-                        "writableRoots": [str(cwd)],
-                        "networkAccess": False,
-                    },
-                },
-                request_timeout=30,
-            )
-            try:
-                turn_id = turn_result["turn"]["id"]
-            except (KeyError, TypeError) as exc:
-                raise AppServerProtocolError("turn/start retornou um schema incompatível.") from exc
-            queue = self._turn_queue(turn_id)
-            events: list[dict[str, Any]] = []
+            thread_id: str | None = None
+            turn_id: str | None = None
+            work_submitted = False
+            work_finished = False
             try:
                 async with asyncio.timeout(self.settings.timeout_seconds):
+                    thread_result = await self._request_without_start(
+                        "thread/start",
+                        {
+                            "cwd": str(cwd),
+                            "ephemeral": True,
+                            "approvalPolicy": "never",
+                            "sandbox": "workspace-write",
+                            "modelProvider": "openai",
+                            "allowProviderModelFallback": False,
+                            "config": {
+                                "features.shell_tool": False,
+                                "features.unified_exec": False,
+                            },
+                            "developerInstructions": DEVELOPER_INSTRUCTIONS,
+                            "runtimeWorkspaceRoots": [str(cwd)],
+                        },
+                        request_timeout=30,
+                    )
+                    thread_id = self._response_id(thread_result, "thread", "thread/start")
+                    self._active_thread_id = thread_id
+                    # Dentro do lock e no mesmo processo: uma chamada em fila não reutiliza
+                    # uma verificação antiga, nem reinicia o processo depois de verificar a conta.
+                    account = await self.account_read(start_if_needed=False)
+                    if self.settings.allow_api_key or account.auth_mode == "apikey":
+                        raise APIKeyAuthenticationBlockedError(
+                            "Autenticação por API key bloqueada. Execute 'codex login' com ChatGPT."
+                        )
+                    if account.auth_mode != "chatgpt":
+                        raise AuthenticationRequiredError(
+                            "Autenticação ChatGPT ausente. Execute 'codex login'."
+                        )
+                    inputs: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+                    inputs.extend({"type": "localImage", "path": str(p)} for p in attachments)
+                    # Uma resposta perdida não autoriza repetir uma geração já submetida.
+                    work_submitted = True
+                    turn_result = await self._request_without_start(
+                        "turn/start",
+                        {
+                            "threadId": thread_id,
+                            "input": inputs,
+                            "cwd": str(cwd),
+                            "approvalPolicy": "never",
+                            "sandboxPolicy": {
+                                "type": "workspaceWrite",
+                                "writableRoots": [str(cwd)],
+                                "networkAccess": False,
+                            },
+                        },
+                        request_timeout=30,
+                    )
+                    turn_id = self._response_id(turn_result, "turn", "turn/start")
+                    queue = self._turn_queue(turn_id)
+                    if self._reader_failure is not None:
+                        raise self._reader_failure
+                    events: deque[dict[str, Any]] = deque(maxlen=256)
                     while True:
                         event = await queue.get()
                         events.append(event)
@@ -522,10 +596,11 @@ class CodexAppClient:
                             raise AppServerProtocolError(str(event["params"].get("error")))
                         if method != "turn/completed":
                             continue
+                        work_finished = True
                         turn = event.get("params", {}).get("turn", {})
                         status = turn.get("status")
                         if status == "completed":
-                            return extract_image_artifact(events)
+                            return extract_image_artifact(list(events))
                         error = turn.get("error")
                         error_text = redact_diagnostic(error or "sem detalhe")
                         if status == "interrupted":
@@ -536,19 +611,61 @@ class CodexAppClient:
                             raise PolicyRefusalError("A geração foi recusada por política.")
                         raise TurnFailedError(f"O turno de imagem falhou: {error_text}")
             except TimeoutError as exc:
-                with contextlib.suppress(Exception):
-                    await self.request(
-                        "turn/interrupt",
-                        {"threadId": thread_id, "turnId": turn_id},
-                        request_timeout=5,
-                    )
                 raise GenerationTimeoutError(
                     f"A geração excedeu {self.settings.timeout_seconds:g} segundos; "
                     "não houve retry."
                 ) from exc
             finally:
-                self._turn_queues.pop(turn_id, None)
-                self._turn_backlog.pop(turn_id, None)
+                # finally também cobre CancelledError (cancelamento MCP) e falha de turn/start.
+                try:
+                    if work_submitted and not work_finished:
+                        await self._stop_image_turn(thread_id, turn_id)
+                    if thread_id is not None and self.running:
+                        try:
+                            await self._request_without_start(
+                                "thread/unsubscribe", {"threadId": thread_id}, request_timeout=5
+                            )
+                        except AppServerProtocolError:
+                            await self.shutdown()
+                    elif thread_id is None:
+                        await self.shutdown()
+                finally:
+                    self._active_thread_id = None
+                    if turn_id is not None:
+                        self._turn_queues.pop(turn_id, None)
+                    self._turn_backlog.clear()
+
+    @staticmethod
+    def _response_id(result: Mapping[str, Any], field: str, method: str) -> str:
+        value = result.get(field)
+        identifier = value.get("id") if isinstance(value, Mapping) else None
+        if not isinstance(identifier, str) or not identifier:
+            raise AppServerProtocolError(f"{method} retornou um schema incompatível.")
+        return identifier
+
+    async def _stop_image_turn(self, thread_id: str | None, turn_id: str | None) -> None:
+        if thread_id is not None and turn_id is not None and self.running:
+            try:
+                await self._request_without_start(
+                    "turn/interrupt",
+                    {"threadId": thread_id, "turnId": turn_id},
+                    request_timeout=5,
+                )
+                # O ACK confirma o pedido, não o fim do trabalho. Só liberar a fila
+                # depois do evento terminal; caso contrário, encerrar o filho.
+                queue = self._turn_queue(turn_id)
+                async with asyncio.timeout(min(5, self.settings.timeout_seconds)):
+                    while True:
+                        event = await queue.get()
+                        if event.get("method") == "turn/completed":
+                            return
+                        if event.get("method") == "_process/error":
+                            break
+            except (AppServerProtocolError, TimeoutError):
+                pass
+        # Se não recebemos o ID ou o pipe falhou, interromper o próprio filho é a única
+        # opção local segura; não iniciar outro processo nem repetir a geração.
+        await self.shutdown()
 
     async def require_imagegen(self, cwd: Path) -> None:
         available = await self.imagegen_available(cwd)

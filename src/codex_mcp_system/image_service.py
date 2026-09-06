@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import unicodedata
 import uuid
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +39,7 @@ MAX_PROMPT_CHARS = 8_000
 MAX_REFERENCE_IMAGES = 4
 MAX_REFERENCE_BYTES = 20 * 1024 * 1024
 MAX_TOTAL_REFERENCE_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
 SUPPORTED_INPUT_FORMATS = {"PNG", "JPEG", "WEBP"}
 FORMAT_SUFFIX = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
 FORMAT_MIME = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
@@ -77,6 +79,8 @@ def validate_size(size: str) -> str:
     if match is None:
         raise ValueError("size deve ser 'auto' ou WIDTHxHEIGHT.")
     width, height = (int(value) for value in match.groups())
+    if not width or not height:
+        raise ValueError("As dimensões devem ser maiores que zero.")
     short, long = sorted((width, height))
     pixels = width * height
     if (
@@ -99,11 +103,11 @@ def sanitize_filename(filename: str, output_format: OutputFormat) -> str:
         raise InvalidPathError("output_filename deve ter entre 1 e 180 caracteres.")
     if Path(filename).is_absolute() or Path(filename).name != filename:
         raise InvalidPathError("output_filename deve conter somente um nome, sem diretórios.")
-    if "/" in filename or "\\" in filename or filename in {".", ".."} or "\x00" in filename:
+    if "/" in filename or "\\" in filename or ".." in filename or "\x00" in filename:
         raise InvalidPathError("output_filename contém um caminho inválido.")
     normalized = unicodedata.normalize("NFKC", filename).strip().lstrip(".")
     normalized = _SAFE_FILENAME_RE.sub("-", normalized).strip("-.")
-    if not normalized:
+    if not normalized or ".." in normalized:
         raise InvalidPathError("output_filename não contém caracteres utilizáveis.")
     expected = FORMAT_SUFFIX[output_format]
     suffix = Path(normalized).suffix.lower()
@@ -116,6 +120,8 @@ def sanitize_filename(filename: str, output_format: OutputFormat) -> str:
         normalized += expected
     elif output_format == "jpeg" and suffix == ".jpeg":
         normalized = str(Path(normalized).with_suffix(".jpg"))
+    if len(normalized.encode("utf-8")) > 200:
+        raise InvalidPathError("O nome do arquivo é longo demais em UTF-8; use um nome menor.")
     return normalized
 
 
@@ -135,16 +141,25 @@ def validate_local_image(
             f"Imagem {resolved.name} deve ter entre 1 byte e {max_bytes} bytes."
         )
     try:
-        with Image.open(resolved) as opened:
-            image_format = str(opened.format or "").upper()
-            width, height = opened.size
-            if getattr(opened, "is_animated", False):
-                raise InvalidImageError("Imagens animadas não são aceitas como referência.")
-            opened.verify()
-    except (UnidentifiedImageError, OSError, SyntaxError) as exc:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(resolved) as opened:
+                image_format = str(opened.format or "").upper()
+                width, height = opened.size
+                if width * height > MAX_IMAGE_PIXELS:
+                    raise InvalidImageError("A imagem excede o limite de 40 milhões de pixels.")
+                if image_format not in SUPPORTED_INPUT_FORMATS:
+                    raise InvalidImageError("Formato de entrada permitido: PNG, JPEG ou WebP.")
+                if getattr(opened, "is_animated", False):
+                    raise InvalidImageError("Imagens animadas não são aceitas como referência.")
+                opened.verify()
+            # verify() sozinho não detecta todos os JPEGs/WebPs truncados.
+            with Image.open(resolved) as opened:
+                opened.load()
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise InvalidImageError("A imagem excede o limite seguro de pixels.") from exc
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
         raise InvalidImageError(f"Arquivo não é uma imagem válida: {resolved}") from exc
-    if image_format not in SUPPORTED_INPUT_FORMATS:
-        raise InvalidImageError("Formato de entrada permitido: PNG, JPEG ou WebP.")
     return ValidatedImage(
         path=resolved,
         format=image_format,
@@ -186,25 +201,6 @@ def _candidate_path(directory: Path, filename: str, index: int) -> Path:
     return directory / f"{original.stem}-{index}{original.suffix}"
 
 
-def _write_rendered_image(source: Path, temporary: Path, output_format: OutputFormat) -> None:
-    with Image.open(source) as image:
-        save_format = output_format.upper()
-        kwargs: dict[str, object] = {}
-        if output_format == "jpeg":
-            save_format = "JPEG"
-            if image.mode not in {"RGB", "L"}:
-                background = Image.new("RGB", image.size, "white")
-                if "A" in image.getbands():
-                    background.paste(image, mask=image.getchannel("A"))
-                    image = background
-                else:
-                    image = image.convert("RGB")
-            kwargs = {"quality": 95, "optimize": True}
-        elif output_format == "webp":
-            kwargs = {"quality": 95, "method": 6}
-        image.save(temporary, format=save_format, **kwargs)
-
-
 def publish_artifact(
     artifact: AppServerImageArtifact,
     *,
@@ -213,9 +209,15 @@ def publish_artifact(
     output_format: OutputFormat,
 ) -> ValidatedImage:
     source = validate_local_image(artifact.source_path, max_bytes=64 * 1024 * 1024)
+    expected_format = "JPEG" if output_format == "jpeg" else output_format.upper()
+    if source.format != expected_format:
+        raise InvalidImageError(
+            f"O Codex devolveu {source.format}, mas foi solicitado {expected_format}. "
+            "Não houve conversão local nem nova geração."
+        )
     filename = (
         sanitize_filename(output_filename, output_format)
-        if output_filename
+        if output_filename is not None
         else _default_filename(output_format)
     )
     temporary_handle = tempfile.NamedTemporaryFile(
@@ -227,16 +229,11 @@ def publish_artifact(
     temporary = Path(temporary_handle.name)
     temporary_handle.close()
     try:
-        expected_pillow_format = "JPEG" if output_format == "jpeg" else output_format.upper()
-        if source.format == expected_pillow_format:
-            with source.path.open("rb") as reader, temporary.open("wb") as writer:
-                shutil.copyfileobj(reader, writer, length=1024 * 1024)
-                writer.flush()
-                os.fsync(writer.fileno())
-        else:
-            _write_rendered_image(source.path, temporary, output_format)
-            with temporary.open("rb") as written:
-                os.fsync(written.fileno())
+        with source.path.open("rb") as reader, temporary.open("wb") as writer:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        validate_local_image(temporary, max_bytes=64 * 1024 * 1024)
         os.chmod(temporary, 0o600)
         for index in range(1, 10_000):
             destination = _candidate_path(output_directory, filename, index)
@@ -247,6 +244,10 @@ def publish_artifact(
                 continue
         else:
             raise OutputDirectoryError("Não foi possível reservar um nome de saída exclusivo.")
+    except OSError as exc:
+        raise OutputDirectoryError(
+            f"Não foi possível salvar a imagem em {output_directory}; verifique espaço e permissão."
+        ) from exc
     finally:
         temporary.unlink(missing_ok=True)
     return validate_local_image(destination, max_bytes=64 * 1024 * 1024)
@@ -271,9 +272,13 @@ def _prompt_envelope(
         ]
         if has_mask:
             labels.append(
-                f"Imagem {reference_count + 1}: máscara; áreas marcadas delimitam a edição"
+                f"Imagem {reference_count + 1}: guia opcional da área a editar; "
+                "use as marcações visuais para localizar as alterações"
             )
-        references = "\nIMAGENS LOCAIS ANEXADAS:\n- " + "\n- ".join(labels)
+        references = (
+            "\nPreserve todas as partes que o usuário não pediu para alterar."
+            "\nIMAGENS LOCAIS ANEXADAS:\n- " + "\n- ".join(labels)
+        )
     return f"""$imagegen
 {action} exatamente uma imagem usando somente a capacidade integrada de imagem.
 
@@ -347,7 +352,8 @@ class ImageService:
             known_limitations=[
                 "Um trabalho de imagem por vez.",
                 "O backend integrado pode normalizar as dimensões solicitadas.",
-                "A máscara é anexada como imagem local e interpretada semanticamente pelo Codex.",
+                "Um guia opcional pode marcar a área a editar; "
+                "o recorte não é garantido pixel a pixel.",
                 "Sem garantia de SLA ou estabilidade equivalente à OpenAI API.",
             ],
             message=(
@@ -386,6 +392,8 @@ class ImageService:
     ) -> ServiceImageResult:
         visual_prompt = validate_prompt(prompt)
         normalized_size = validate_size(size)
+        if output_filename is not None:
+            output_filename = sanitize_filename(output_filename, output_format)
         if background == "transparent" and output_format == "jpeg":
             raise ValueError("JPEG não suporta fundo transparente; use PNG ou WebP.")
         target_dir = prepare_output_directory(
@@ -429,6 +437,8 @@ class ImageService:
     ) -> ServiceImageResult:
         visual_prompt = validate_prompt(prompt)
         normalized_size = validate_size(size)
+        if output_filename is not None:
+            output_filename = sanitize_filename(output_filename, output_format)
         if not image_paths:
             raise InvalidImageError("edit_image exige pelo menos uma imagem local.")
         if len(image_paths) > MAX_REFERENCE_IMAGES:

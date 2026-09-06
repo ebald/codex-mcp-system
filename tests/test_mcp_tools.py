@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from mcp import Client
-from mcp.types import ImageContent
+from mcp import Client, StdioServerParameters
+from mcp.types import ImageContent, ResourceLink
 
 from codex_mcp_system.config import Settings
 from codex_mcp_system.image_service import ServiceImageResult
@@ -112,3 +112,36 @@ async def test_stdio_server_does_not_print_startup_logs_to_stdout(
     stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
     assert process.returncode == 0
     assert stdout == b""
+
+
+async def test_generate_and_edit_over_stdio_with_fake_backend(
+    tmp_path: Path, fake_codex: Path, png_file: Path
+) -> None:
+    output = tmp_path / "output with spaces"
+    transport = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "codex_mcp_system", "serve"],
+        env={
+            "CODEX_MCP_CODEX_BIN": str(fake_codex),
+            "CODEX_MCP_OUTPUT_DIR": str(output),
+            "FAKE_CODEX_ARTIFACT": str(png_file),
+        },
+    )
+    async with Client(transport) as client:
+        generated = await client.call_tool("generate_image", {"prompt": "a red cube"})
+        assert not generated.is_error
+        assert generated.structured_content["width"] == 32
+        assert await asyncio.to_thread(Path(generated.structured_content["path"]).is_file)
+        assert any(isinstance(block, ImageContent) for block in generated.content)
+        edited = await client.call_tool(
+            "edit_image",
+            {
+                "prompt": "change only the background",
+                "image_paths": [str(png_file)],
+                "include_inline": False,
+            },
+        )
+        assert not edited.is_error
+        assert edited.structured_content["auth_mode"] == "chatgpt"
+        link = next(block for block in edited.content if isinstance(block, ResourceLink))
+        assert "%20" in str(link.uri)

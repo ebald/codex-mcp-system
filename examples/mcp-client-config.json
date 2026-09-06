@@ -4,6 +4,7 @@
       "command": "/Users/baker/repos-own/codex-mcp-system/.venv/bin/codex-mcp-system",
       "args": ["serve"],
       "env": {
+        "CODEX_MCP_CODEX_BIN": "/Applications/ChatGPT.app/Contents/Resources/codex",
         "CODEX_MCP_OUTPUT_DIR": "/Users/baker/Pictures/codex-mcp-system"
       }
     }
