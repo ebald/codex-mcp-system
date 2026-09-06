@@ -121,6 +121,9 @@ Não adicione `OPENAI_API_KEY`. O mesmo exemplo está em `examples/mcp-client-co
 
 ## Usar no Claude Code
 
+O passo a passo completo, incluindo instalação limpa, cadastro, verificação e solução de problemas,
+está em [docs/instalacao-claude-code.md](docs/instalacao-claude-code.md).
+
 O Claude Code inicia este servidor automaticamente quando precisa dele. Não é necessário deixar
 `serve` aberto em outro terminal nem manter uma conversa do Codex aberta. O executável `codex`
 e o login ChatGPT devem continuar disponíveis no computador.
