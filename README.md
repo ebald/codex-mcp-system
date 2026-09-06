@@ -135,9 +135,10 @@ CODEX_MCP_CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex \
 Se o resultado mostrar `doctor_ok: true`, cadastre o servidor uma única vez:
 
 ```bash
-claude mcp add --transport stdio --scope user \
+claude mcp add \
   --env CODEX_MCP_CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex \
   --env CODEX_MCP_OUTPUT_DIR=/Users/baker/Pictures/codex-mcp-system \
+  --transport stdio --scope user \
   codex-mcp-system -- \
   /Users/baker/repos-own/codex-mcp-system/.venv/bin/codex-mcp-system serve
 ```
@@ -145,6 +146,12 @@ claude mcp add --transport stdio --scope user \
 O escopo `user` disponibiliza o servidor em todos os seus projetos do Claude Code. Para disponibilizar
 somente no projeto atual, troque por `--scope local`. Os caminhos acima são os desta instalação;
 em outro computador, use os caminhos retornados por `command -v codex` e pelo seu ambiente virtual.
+Mantenha `--transport` e `--scope` depois de `--env`: isso evita que a CLI interprete o nome do servidor
+como mais uma variável de ambiente.
+
+O cadastro também vale para sessões locais da aba **Code** do aplicativo Claude. A tela de
+"Add custom connector", que pede uma URL HTTPS, é destinada a conectores remotos. Para este MCP
+local, use o cadastro acima e abra uma nova sessão Code após adicionar.
 
 Confira o cadastro:
 
